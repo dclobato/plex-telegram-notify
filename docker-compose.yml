@@ -1,7 +1,21 @@
-version: "3.9"
 services:
   plex-webhook:
     image: plex-webhook:latest
     container_name: plex-webhook
-    network_mode: host
+    network_mode: bridge
     restart: unless-stopped
+    ports:
+      - ${SERVER_PORT:-9000}:${SERVER_PORT:-9000}
+    environment:
+      - SERVER_HOST=${SERVER_HOST:-0.0.0.0}
+      - SERVER_PORT=${SERVER_PORT:-9000}
+      - LOG_LEVEL=${LOG_LEVEL:-WARNING}
+      - DRYRUN=${DRYRUN:-false}
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET}
+      - BOT_TOKEN=${BOT_TOKEN}
+      - CHAT_ID=${CHAT_ID}
+      - PLEX_URL=${PLEX_URL}
+      - PLEX_TOKEN=${PLEX_TOKEN}
+    # Alternatively, use env_file to load from .env
+    # env_file:
+    #   - .env
