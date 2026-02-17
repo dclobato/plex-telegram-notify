@@ -2,8 +2,10 @@ import json
 import logging
 import os
 import sys
+from email import message_from_bytes
+from email.policy import default as email_policy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Optional, Dict, Any
+from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
 import requests
@@ -14,11 +16,9 @@ load_dotenv()
 
 ### Configure logging ###
 log_level = os.getenv('LOG_LEVEL', 'WARNING').upper()
-logging.basicConfig(
-        level=getattr(logging, log_level, logging.WARNING),
+logging.basicConfig(level=getattr(logging, log_level, logging.WARNING),
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-        )
+        datefmt='%Y-%m-%d %H:%M:%S')
 logger = logging.getLogger(__name__)
 
 ### Configure your server from environment variables ###
@@ -31,10 +31,6 @@ webhookSecret = os.getenv('WEBHOOK_SECRET')  # Optional webhook authentication
 botToken = os.getenv('BOT_TOKEN')
 chatID = os.getenv('CHAT_ID')
 
-### Configure Plex server (optional, for thumbnail images) ###
-plexUrl = os.getenv('PLEX_URL')
-plexToken = os.getenv('PLEX_TOKEN')
-
 # Validate required environment variables
 if not botToken or not chatID:
     logger.error("BOT_TOKEN and CHAT_ID environment variables are required")
@@ -44,11 +40,30 @@ if not botToken or not chatID:
 TELEGRAM_SEND_MESSAGE_URL = f"https://api.telegram.org/bot{botToken}/sendMessage"
 TELEGRAM_SEND_PHOTO_URL = f"https://api.telegram.org/bot{botToken}/sendPhoto"
 
-# Check if Plex integration is enabled
-plex_enabled = bool(plexUrl and plexToken)
-
 logger.info(f"Configuration loaded - Server: {hostName}:{serverPort}, Log Level: {log_level}, "
-            f"Dry Run: {dryRun}, Plex Images: {plex_enabled}, Webhook Auth: {bool(webhookSecret)}")
+            f"Dry Run: {dryRun}, Webhook Auth: {bool(webhookSecret)}")
+
+
+def extract_event_data(account: Dict[str, Any],
+                       player: Dict[str, Any],
+                       media: Dict[str, Any]) -> tuple[str, str, str]:
+    """
+    Extract and format common data from webhook event
+
+    Args:
+        account: Account dictionary from Plex webhook
+        player: Player dictionary from Plex webhook
+        media: Metadata dictionary from Plex webhook
+
+    Returns:
+        tuple: (account_title, media_title, player_title)
+    """
+    # Handle guest users (empty title)
+    account_title = account.get("title", "").strip() or "Um usuário visitante"
+    media_title = format_media_title(media)
+    player_title = player.get("title", "Unknown Player")
+
+    return account_title, media_title, player_title
 
 
 def format_media_title(media: Dict[str, Any]) -> str:
@@ -63,114 +78,81 @@ def format_media_title(media: Dict[str, Any]) -> str:
     """
     media_type = media.get("type", "unknown")
 
-    if media_type == "episode":
-        # TV Show Episode: "Series (S##E##) - Episode Title"
-        series_name = media.get("grandparentTitle", "Unknown Series")
-        season_num = media.get("parentIndex", 0)
-        episode_num = media.get("index", 0)
-        episode_title = media.get("title", "Unknown Episode")
+    match media_type:
+        case "episode":
+            # TV Show Episode: "Series (S##E##) - Episode Title"
+            series_name = media.get("grandparentTitle", "Unknown Series")
+            season_num = media.get("parentIndex", 0)
+            episode_num = media.get("index", 0)
+            episode_title = media.get("title", "Unknown Episode")
+            return f"{series_name} (S{season_num:02d}E{episode_num:02d}) - {episode_title}"
 
-        return f"{series_name} (S{season_num:02d}E{episode_num:02d}) - {episode_title}"
+        case "movie":
+            # Movie: "Movie Title (Year)"
+            movie_title = media.get("title", "Unknown Movie")
+            year = media.get("year")
+            if year:
+                return f"{movie_title} ({year})"
+            return movie_title
 
-    elif media_type == "movie":
-        # Movie: "Movie Title (Year)"
-        movie_title = media.get("title", "Unknown Movie")
-        year = media.get("year")
+        case "track":
+            # Music Track: "Artist - Track Title"
+            artist = media.get("grandparentTitle", "Unknown Artist")
+            track_title = media.get("title", "Unknown Track")
+            album = media.get("parentTitle")
+            if album:
+                return f"{artist} - {track_title} (Album: {album})"
+            return f"{artist} - {track_title}"
 
-        if year:
-            return f"{movie_title} ({year})"
-        return movie_title
-
-    elif media_type == "track":
-        # Music Track: "Artist - Track Title"
-        artist = media.get("grandparentTitle", "Unknown Artist")
-        track_title = media.get("title", "Unknown Track")
-        album = media.get("parentTitle")
-
-        if album:
-            return f"{artist} - {track_title} (Album: {album})"
-        return f"{artist} - {track_title}"
-
-    else:
-        # Fallback for unknown types
-        return media.get("title", "Unknown Media")
-
-
-def get_media_thumbnail(media: Dict[str, Any]) -> Optional[str]:
-    """
-    Get the best thumbnail path for the media type
-
-    Args:
-        media: Metadata dictionary from Plex webhook
-
-    Returns:
-        Thumbnail path or None
-    """
-    media_type = media.get("type", "unknown")
-
-    if media_type == "episode":
-        # For episodes, prefer grandparent (series) thumb over episode thumb
-        return media.get("grandparentThumb") or media.get("thumb")
-    elif media_type == "movie":
-        # For movies, use the movie thumb
-        return media.get("thumb")
-    elif media_type == "track":
-        # For music, prefer album art
-        return media.get("parentThumb") or media.get("thumb")
-    else:
-        # Fallback
-        return media.get("thumb")
+        case _:
+            # Fallback for unknown types
+            return media.get("title", "Unknown Media")
 
 
 class MyServer(BaseHTTPRequestHandler):
 
     @staticmethod
     def send_notify(msg: str,
-                    image_path: Optional[str] = None) -> None:
+                    image_data: Optional[bytes] = None,
+                    image_type: str = "image/jpeg") -> None:
         """
         Send notification to Telegram, optionally with image
 
         Args:
             msg: Message text to send
-            image_path: Optional Plex thumbnail path (e.g., "/library/metadata/123/thumb/456")
+            image_data: Optional image data as bytes (from Plex webhook multipart)
+            image_type: MIME type of the image (e.g., "image/jpeg", "image/png")
         """
         if dryRun:
             logger.info(f"[DRY RUN] Would send Telegram notification: {msg}")
-            if image_path and plex_enabled:
-                logger.info(f"[DRY RUN] Would include image: {plexUrl}{image_path}")
+            if image_data:
+                logger.info(f"[DRY RUN] Would include image ({len(image_data)} bytes, "
+                            f"{image_type})")
             return
 
-        # Try to send with image if Plex is configured and image path is provided
-        if plex_enabled and image_path:
+        # Try to send with image if image data is provided
+        if image_data:
             try:
-                # Download image from Plex
-                image_url = f"{plexUrl}{image_path}?X-Plex-Token={plexToken}"
-                # Mask token in logs for security
-                safe_url = f"{plexUrl}{image_path}?X-Plex-Token=***MASKED***"
-                logger.debug(f"Downloading image from Plex: {safe_url}")
-
-                image_response = requests.get(image_url, timeout=5)
-                image_response.raise_for_status()
-
-                # Send photo with caption to Telegram
-                logger.debug(f"Sending Telegram notification with image")
-                files = { "photo": ("thumb.jpg", image_response.content, "image/jpeg") }
+                logger.debug(f"Sending Telegram notification with image ({len(image_data)} bytes)")
+                files = { "photo": ("thumb.jpg", image_data, image_type) }
                 data = { "chat_id": chatID, "caption": msg }
 
-                response = requests.post(TELEGRAM_SEND_PHOTO_URL, data=data, files=files, timeout=10)
+                response = requests.post(TELEGRAM_SEND_PHOTO_URL,
+                                         data=data,
+                                         files=files,
+                                         timeout=10)
                 response.raise_for_status()
                 logger.info(f"Telegram notification with image sent successfully")
                 return
 
             except requests.exceptions.RequestException as e:
-                logger.warning(f"Failed to send image, falling back to text-only: {e}")
-                # Fall through to send text-only message
+                logger.warning(f"Failed to send image, falling back to text-only: {e}")  # Fall
+                # through to send text-only message
 
         # Send text-only message (fallback or if no image)
         try:
             payload = {
-                "chat_id": chatID,
-                "text"   : msg
+                "chat_id": chatID, "text": msg
                 }
             logger.debug(f"Sending Telegram notification (text-only): {msg}")
             response = requests.post(TELEGRAM_SEND_MESSAGE_URL, json=payload, timeout=10)
@@ -192,7 +174,8 @@ class MyServer(BaseHTTPRequestHandler):
                     sys.exit(1)
 
                 # Temporary errors → Log and continue
-                logger.warning(f"Temporary error sending Telegram notification (HTTP {status_code}): {e}")
+                logger.warning(f"Temporary error sending Telegram notification (HTTP "
+                               f"{status_code}): {e}")
             else:
                 # Network errors (timeout, connection refused, etc.) → Log and continue
                 logger.warning(f"Network error sending Telegram notification: {e}")
@@ -200,43 +183,48 @@ class MyServer(BaseHTTPRequestHandler):
             logger.warning("Service will continue running, but this notification was not sent")
             logger.warning("Check logs and Telegram API status if errors persist")
 
-    def handle_mediaPlay(self, account, player, media):
-        account_title = account.get("title", "Unknown User")
-        media_title = format_media_title(media)
-        player_title = player.get("title", "Unknown Player")
-        thumbnail = get_media_thumbnail(media)
+    def handle_mediaPlay(self,
+                         account,
+                         player,
+                         media,
+                         thumbnail_data=None,
+                         thumbnail_type="image/jpeg"):
+        account_title, media_title, player_title = extract_event_data(account, player, media)
 
-        logger.info(f"Media play event - User: {account_title}, Media: {media_title}, Player: "
-                    f"{player_title}")
+        logger.info(f"Media play event - User: {account_title}, Media: {media_title}, Player: {
+        player_title}")
         message = f"{account_title} começou a tocar {media_title} em {player_title}"
-        self.send_notify(message, image_path=thumbnail)
+        self.send_notify(message, image_data=thumbnail_data, image_type=thumbnail_type)
 
-    def handle_mediaPause(self, account, player, media):
-        account_title = account.get("title", "Unknown User")
-        media_title = format_media_title(media)
-        player_title = player.get("title", "Unknown Player")
+    def handle_mediaPause(self,
+                          account,
+                          player,
+                          media):
+        account_title, media_title, player_title = extract_event_data(account, player, media)
 
         logger.debug(f"Media pause event - User: {account_title}, Media: {media_title}, Player: "
                      f"{player_title}")
 
-    def handle_mediaResume(self, account, player, media):
-        account_title = account.get("title", "Unknown User")
-        media_title = format_media_title(media)
-        player_title = player.get("title", "Unknown Player")
+    def handle_mediaResume(self,
+                           account,
+                           player,
+                           media):
+        account_title, media_title, player_title = extract_event_data(account, player, media)
 
-        logger.debug(f"Media resume event - User: {account_title}, Media: {media_title}, "
-                     f"Player: {player_title}")
+        logger.debug(f"Media resume event - User: {account_title}, Media: {media_title}, Player: {player_title}")
 
-    def handle_mediaStop(self, account, player, media):
-        account_title = account.get("title", "Unknown User")
-        media_title = format_media_title(media)
-        player_title = player.get("title", "Unknown Player")
-        thumbnail = get_media_thumbnail(media)
+    def handle_mediaStop(self,
+                         account,
+                         player,
+                         media,
+                         thumbnail_data=None,
+                         thumbnail_type="image/jpeg"):
+        account_title, media_title, player_title = extract_event_data(account, player, media)
 
         logger.info(f"Media stop event - User: {account_title}, Media: {media_title}, Player: "
                     f"{player_title}")
         message = f"{account_title} parou de tocar {media_title} em {player_title}"
-        self.send_notify(message, image_path=thumbnail)
+        self.send_notify(message, image_data=thumbnail_data, image_type=thumbnail_type)
 
     def do_POST(self) -> None:
         try:
@@ -257,45 +245,71 @@ class MyServer(BaseHTTPRequestHandler):
             content_length = int(self.headers["Content-Length"])
             logger.debug(f"Received POST request - Content-Length: {content_length}")
 
-            # read post bytes from POST request and decode
+            # Read raw POST data (binary)
             post_data = self.rfile.read(content_length)
-            post_data_decode = post_data.decode("utf-8", "ignore")
 
-            # get the boundary from header and split the payload
-            header_boundary = self.headers.get_boundary()
-            if not header_boundary:
-                logger.warning("Missing boundary in multipart request")
+            # Parse multipart/form-data correctly using email.message
+            # This preserves binary data (images) and properly handles the structure
+            content_type = self.headers.get('Content-Type', '')
+
+            if not content_type.startswith('multipart/'):
+                logger.warning(f"Unexpected Content-Type: {content_type}")
                 self.send_response(400)
                 self.end_headers()
                 return
 
-            post_data_list = post_data_decode.split(header_boundary)
+            # Construct proper email headers for parsing
+            headers_bytes = f"Content-Type: {content_type}\r\n\r\n".encode('utf-8')
+            full_message = headers_bytes + post_data
 
-            # Validate multipart structure
-            if len(post_data_list) < 2:
-                logger.warning("Invalid multipart structure - insufficient parts")
-                self.send_response(400)
-                self.end_headers()
-                return
-
-            # trim and parse json payload from second payload object (Plex Webhook sends
-            # sometimes an image as third object)
-            post_data_payload = post_data_list[1]
-            json_start = post_data_payload.find("{")
-            json_end = post_data_payload.rfind("}")
-
-            if json_start == -1 or json_end == -1:
-                logger.warning("No JSON found in multipart payload")
-                self.send_response(400)
-                self.end_headers()
-                return
-
-            post_payload = post_data_payload[json_start:json_end + 1]
-
+            # Parse multipart message
             try:
-                payload = json.loads(post_payload)
-            except json.JSONDecodeError as e:
-                logger.warning(f"Invalid JSON in webhook payload: {e}")
+                msg = message_from_bytes(full_message, policy=email_policy)
+            except Exception as e:
+                logger.warning(f"Failed to parse multipart message: {e}")
+                self.send_response(400)
+                self.end_headers()
+                return
+
+            # Extract JSON payload and thumbnail image from multipart parts
+            payload = None
+            thumbnail_data = None
+            thumbnail_type = "image/jpeg"
+
+            for part in msg.iter_parts():
+                content_type = part.get_content_type()
+                logger.debug(f"Found multipart part with content-type: {content_type}")
+
+                # Look for the JSON payload (usually application/json or text/plain)
+                if content_type in ['application/json', 'text/plain']:
+                    try:
+                        content = part.get_content()
+
+                        # Handle both string and bytes
+                        if isinstance(content, bytes):
+                            content = content.decode('utf-8')
+
+                        # Try to parse as JSON
+                        payload = json.loads(content)
+                        logger.debug("Successfully extracted JSON from multipart")
+                    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                        logger.debug(f"Part is not valid JSON, trying next part: {e}")
+                        continue
+
+                # Look for thumbnail image
+                elif content_type.startswith('image/'):
+                    try:
+                        thumbnail_data = part.get_content()
+                        thumbnail_type = content_type
+                        logger.debug(f"Successfully extracted thumb"
+                                     f"nail image ({len(thumbnail_data)} bytes, {content_type})")
+                    except Exception as e:
+                        logger.debug(f"Failed to extract image: {e}")
+                        continue
+
+            # Validate that we found a JSON payload
+            if payload is None:
+                logger.warning("No valid JSON payload found in multipart message")
                 self.send_response(400)
                 self.end_headers()
                 return
@@ -326,16 +340,17 @@ class MyServer(BaseHTTPRequestHandler):
             logger.info(f"Received webhook event: {event}")
 
             # handle playback events
-            if event == "media.play":
-                self.handle_mediaPlay(account, player, media)
-            elif event == "media.resume":
-                self.handle_mediaResume(account, player, media)
-            elif event == "media.pause":
-                self.handle_mediaPause(account, player, media)
-            elif event == "media.stop":
-                self.handle_mediaStop(account, player, media)
-            else:
-                logger.warning(f"Unhandled event type: {event}")
+            match event:
+                case "media.play":
+                    self.handle_mediaPlay(account, player, media, thumbnail_data, thumbnail_type)
+                case "media.resume":
+                    self.handle_mediaResume(account, player, media)
+                case "media.pause":
+                    self.handle_mediaPause(account, player, media)
+                case "media.stop":
+                    self.handle_mediaStop(account, player, media)
+                case _:
+                    logger.warning(f"Unhandled event type: {event}")
 
             self.send_response(200)
             self.end_headers()

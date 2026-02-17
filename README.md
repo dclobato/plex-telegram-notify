@@ -3,6 +3,12 @@
 ## Introduction
 Simple python script for plex web hooks to send notifications over telegram. Configure your settings using environment variables and your telegram-bot (created with botfather). You can run the script directly with python or with the provided docker files as a container.
 
+## Requirements
+
+- **Python 3.10+** (required for `match/case` statements)
+- **Plex Pass** subscription (for webhook feature)
+- **Telegram Bot** (create with @BotFather)
+
 ## Configuration
 
 ### Environment Variables
@@ -17,8 +23,6 @@ The application uses the following environment variables:
 | `WEBHOOK_SECRET` | Secret path for webhook endpoint (e.g., `my-secret-xyz123`) | - | No |
 | `BOT_TOKEN` | Telegram bot token from BotFather | - | Yes |
 | `CHAT_ID` | Telegram chat ID to send notifications | - | Yes |
-| `PLEX_URL` | Plex server URL for thumbnail images (e.g., `http://192.168.1.100:32400`) | - | No |
-| `PLEX_TOKEN` | Plex authentication token (X-Plex-Token) | - | No |
 
 ### Setup Instructions
 
@@ -38,10 +42,6 @@ The application uses the following environment variables:
 
    # Optional: Enable webhook path security (recommended for production)
    WEBHOOK_SECRET=my-super-secret-endpoint-xyz123
-
-   # Optional: Enable thumbnail images in notifications
-   PLEX_URL=http://192.168.1.100:32400
-   PLEX_TOKEN=your-plex-token
    ```
 
 ### Getting Telegram Bot Token and Chat ID
@@ -57,23 +57,18 @@ The application uses the following environment variables:
    - Look for `"chat":{"id":123456789}` in the response
    - The number is your `CHAT_ID`
 
-### Getting Plex Token (Optional - for thumbnail images)
+### Thumbnail Images in Notifications
 
-1. **Find your Plex Token**:
-   - Open Plex Web App
-   - Play any media and open the console (F12)
-   - Go to Network tab
-   - Look for requests to your Plex server
-   - Find `X-Plex-Token` in the request headers or URL parameters
+The application **automatically includes thumbnail images** in Telegram notifications!
 
-2. **Alternative method**:
-   - Sign in to Plex Web App
-   - Navigate to any library item
-   - Click "Get Info" → "View XML"
-   - Look for `X-Plex-Token` in the URL
-   - Example: `http://192.168.1.100:32400/library/metadata/123?X-Plex-Token=YOUR_TOKEN_HERE`
+Plex webhooks include the media thumbnail as part of the multipart POST request. The application extracts this image and sends it directly to Telegram - no additional configuration needed.
 
-**Note**: If `PLEX_URL` and `PLEX_TOKEN` are not configured, notifications will be sent as text-only (without images).
+**Features**:
+- ✅ Automatic thumbnail extraction from Plex webhook
+- ✅ No additional configuration required (no PLEX_URL or PLEX_TOKEN needed)
+- ✅ Works with all media types (movies, TV shows, music)
+- ✅ Faster than downloading from Plex server (uses thumbnail from POST)
+- ✅ More reliable (works even if Plex server isn't accessible by URL)
 
 ### Configuring Plex Webhook
 
@@ -180,6 +175,6 @@ docker run -d \
 
 ### Running Directly with Python
 ```bash
-pip install requests python-dotenv
+pip install -r requirements.txt
 python run.py
 ```
