@@ -226,6 +226,24 @@ class MyServer(BaseHTTPRequestHandler):
         message = f"{account_title} parou de tocar {media_title} em {player_title}"
         self.send_notify(message, image_data=thumbnail_data, image_type=thumbnail_type)
 
+    def do_GET(self) -> None:
+        """Handle GET requests for healthcheck endpoint"""
+        # Parse URL path
+        parsed_url = urlparse(self.path)
+        request_path = parsed_url.path.strip('/')
+
+        if request_path == 'health':
+            logger.debug("Healthcheck request received")
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            response = json.dumps({"status": "healthy", "service": "plex-telegram-notify"})
+            self.wfile.write(response.encode('utf-8'))
+        else:
+            # Return 404 for other GET requests
+            self.send_response(404)
+            self.end_headers()
+
     def do_POST(self) -> None:
         try:
             # Validate webhook path secret if configured
